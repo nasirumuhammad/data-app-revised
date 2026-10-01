@@ -1,6 +1,14 @@
-import { Column, Entity, Index } from 'typeorm';
+import {
+  Column,
+  Entity,
+  Index,
+  JoinColumn,
+  ManyToOne,
+  Relation,
+} from 'typeorm';
 
 import { BaseEntity } from './base.entity';
+import { User } from './user.entity';
 
 export enum AuthProvider {
   PASSWORD = 'PASSWORD',
@@ -9,9 +17,16 @@ export enum AuthProvider {
 
 @Entity('auth_identities')
 @Index(['provider', 'providerAccountId'], { unique: true })
+@Index(['userId'])
 export class AuthIdentity extends BaseEntity {
-  @Column()
+  @Column({ type: 'uuid' })
   userId!: string;
+
+  @ManyToOne(() => User, (user) => user.authIdentities, {
+    onDelete: 'CASCADE',
+  })
+  @JoinColumn({ name: 'userId' })
+  user!: Relation<User>;
 
   @Column({
     type: 'enum',
@@ -19,9 +34,9 @@ export class AuthIdentity extends BaseEntity {
   })
   provider!: AuthProvider;
 
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   providerAccountId!: string | null;
 
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   passwordHash!: string | null;
 }

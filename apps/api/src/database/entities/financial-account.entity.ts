@@ -1,30 +1,50 @@
-import { Column, Entity, Index } from 'typeorm';
+import {
+  Column,
+  Entity,
+  Index,
+  JoinColumn,
+  ManyToOne,
+  Relation,
+} from 'typeorm';
 
 import { BaseEntity } from './base.entity';
 import { AccountStatus } from '../enums/account-status.enum';
+import { Provider } from './provider.entity';
+import { User } from './user.entity';
 
 @Entity('financial_accounts')
 @Index(['providerId', 'providerReference'], { unique: true })
+@Index(['userId'])
 export class FinancialAccount extends BaseEntity {
-  @Column()
+  @Column({ type: 'uuid' })
   userId!: string;
 
-  @Column()
+  @ManyToOne(() => User, (user) => user.financialAccounts, {
+    onDelete: 'RESTRICT',
+  })
+  @JoinColumn({ name: 'userId' })
+  user!: Relation<User>;
+
+  @Column({ type: 'uuid' })
   providerId!: string;
 
-  @Column({ nullable: true })
+  @ManyToOne(() => Provider, { onDelete: 'RESTRICT' })
+  @JoinColumn({ name: 'providerId' })
+  provider!: Relation<Provider>;
+
+  @Column({ type: 'varchar', nullable: true })
   accountNumber!: string | null;
 
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   accountName!: string | null;
 
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   bankName!: string | null;
 
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   bankCode!: string | null;
 
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   providerReference!: string | null;
 
   @Column({

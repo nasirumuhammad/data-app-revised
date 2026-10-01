@@ -1,13 +1,34 @@
-import { Column, Entity, Index } from 'typeorm';
+import {
+  Column,
+  Entity,
+  Index,
+  JoinColumn,
+  ManyToOne,
+  Relation,
+} from 'typeorm';
 
 import { BaseEntity } from './base.entity';
 import { LedgerEntryType } from '../enums/ledger-entry-type.enum';
+import { Transaction } from './transaction.entity';
+import { Wallet } from './wallet.entity';
 
 @Entity('ledger_entries')
 @Index(['walletId', 'createdAt'])
+// A transaction can be debited, reversed, etc. at most once per entry type,
+// which makes double-debit / double-refund bugs fail at the database level.
+@Index(['transactionId', 'type'], {
+  unique: true,
+  where: '"transactionId" IS NOT NULL',
+})
 export class LedgerEntry extends BaseEntity {
-  @Column()
+  @Column({ type: 'uuid' })
   walletId!: string;
+
+  @ManyToOne(() => Wallet, (wallet) => wallet.ledgerEntries, {
+    onDelete: 'RESTRICT',
+  })
+  @JoinColumn({ name: 'walletId' })
+  wallet!: Relation<Wallet>;
 
   @Column({
     type: 'enum',
@@ -36,13 +57,20 @@ export class LedgerEntry extends BaseEntity {
   })
   balanceAfter!: string;
 
-  @Column({ nullable: true })
+  @Column({ type: 'uuid', nullable: true })
   transactionId!: string | null;
 
-  @Column({ nullable: true })
+  @ManyToOne(() => Transaction, (transaction) => transaction.ledgerEntries, {
+    nullable: true,
+    onDelete: 'RESTRICT',
+  })
+  @JoinColumn({ name: 'transactionId' })
+  transaction!: Relation<Transaction> | null;
+
+  @Column({ type: 'varchar', nullable: true })
   reference!: string | null;
 
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   description!: string | null;
 
   @Column({ type: 'jsonb', nullable: true })
