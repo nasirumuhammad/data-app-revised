@@ -32,9 +32,13 @@ export class ProviderCapabilityEntity extends BaseEntity {
   @Column({ default: true })
   isEnabled!: boolean;
 
-  /** Lower number = tried first by the routing service. */
+  /** Lower number = preferred when provider prices are equal. */
   @Column({ type: 'int', default: 1 })
   priority!: number;
+
+  /** Provider cost for this capability, used by the initial routing policy. */
+  @Column({ type: 'decimal', precision: 19, scale: 2, nullable: true })
+  cost!: string | null;
 
   @Column({ type: 'jsonb', default: () => "'{}'" })
   configuration!: Record<string, unknown>;

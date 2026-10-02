@@ -22,6 +22,17 @@ export class Provider extends BaseEntity {
   @Column({ default: true })
   isEnabled!: boolean;
 
+  /** Consecutive adapter failures used by the circuit breaker. */
+  @Column({ type: 'int', default: 0 })
+  consecutiveFailures!: number;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  lastFailureAt!: Date | null;
+
+  /** Non-null while the provider circuit is open. */
+  @Column({ type: 'timestamptz', nullable: true })
+  circuitOpenedAt!: Date | null;
+
   @OneToMany(
     () => ProviderCapabilityEntity,
     (capability) => capability.provider,

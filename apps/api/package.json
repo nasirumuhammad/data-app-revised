@@ -17,6 +17,7 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
+    "test:int": "jest --testRegex \".*\\.int-spec\\.ts$\" --runInBand",
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "typeorm": "typeorm-ts-node-commonjs",
     "migration:generate": "pnpm typeorm migration:generate -d src/database/data-source.ts",
@@ -29,6 +30,7 @@
     "@nestjs/core": "^11.0.1",
     "@nestjs/jwt": "^12.0.2",
     "@nestjs/platform-express": "^11.0.1",
+    "@nestjs/throttler": "^6.7.1",
     "@nestjs/typeorm": "^12.0.2",
     "bcrypt": "^6.0.0",
     "class-transformer": "^0.5.1",
@@ -76,12 +78,20 @@
     "rootDir": "src",
     "testRegex": ".*\\.spec\\.ts$",
     "transform": {
-      "^.+\\.(t|j)s$": "ts-jest"
+      "^.+\\.(t|j)s$": [
+        "ts-jest",
+        {
+          "tsconfig": "<rootDir>/../tsconfig.jest.json"
+        }
+      ]
     },
     "collectCoverageFrom": [
       "**/*.(t|j)s"
     ],
     "coverageDirectory": "../coverage",
-    "testEnvironment": "node"
+    "testEnvironment": "node",
+    "transformIgnorePatterns": [
+      "/node_modules/(?!(?:\\.pnpm/[^/]+/node_modules/)?@nestjs/(?:jwt|config|typeorm)/)"
+    ]
   }
 }

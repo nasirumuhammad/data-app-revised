@@ -1,0 +1,2232 @@
+diff --git a/apps/api/.env.example b/apps/api/.env.example
+index 9ecad12..071d409 100644
+--- a/apps/api/.env.example
++++ b/apps/api/.env.example
+@@ -7,5 +7,13 @@ DATABASE_NAME=data_app
+ DATABASE_USER=postgres
+ DATABASE_PASSWORD=
+ 
++# Required, at least 32 characters each, and different from each other.
++# Generate with: openssl rand -base64 48
+ JWT_ACCESS_SECRET=
++# Also keys the HMAC that hashes stored refresh tokens.
+ JWT_REFRESH_SECRET=
++
++# Optional (defaults shown)
++# JWT_ACCESS_TTL_SECONDS=900
++# REFRESH_TOKEN_TTL_DAYS=30
++# BCRYPT_ROUNDS=12
+diff --git a/apps/api/package.json b/apps/api/package.json
+index 4075b2f..ba9ad3c 100644
+--- a/apps/api/package.json
++++ b/apps/api/package.json
+@@ -30,6 +30,7 @@
+     "@nestjs/core": "^11.0.1",
+     "@nestjs/jwt": "^12.0.2",
+     "@nestjs/platform-express": "^11.0.1",
++    "@nestjs/throttler": "^6.7.1",
+     "@nestjs/typeorm": "^12.0.2",
+     "bcrypt": "^6.0.0",
+     "class-transformer": "^0.5.1",
+@@ -77,12 +78,20 @@
+     "rootDir": "src",
+     "testRegex": ".*\\.spec\\.ts$",
+     "transform": {
+-      "^.+\\.(t|j)s$": "ts-jest"
++      "^.+\\.(t|j)s$": [
++        "ts-jest",
++        {
++          "tsconfig": "<rootDir>/../tsconfig.jest.json"
++        }
++      ]
+     },
+     "collectCoverageFrom": [
+       "**/*.(t|j)s"
+     ],
+     "coverageDirectory": "../coverage",
+-    "testEnvironment": "node"
++    "testEnvironment": "node",
++    "transformIgnorePatterns": [
++      "/node_modules/(?!(?:\\.pnpm/[^/]+/node_modules/)?@nestjs/(?:jwt|config|typeorm)/)"
++    ]
+   }
+ }
+diff --git a/apps/api/src/app.module.ts b/apps/api/src/app.module.ts
+index eb9afb7..656d6e8 100644
+--- a/apps/api/src/app.module.ts
++++ b/apps/api/src/app.module.ts
+@@ -1,8 +1,13 @@
+ import { Module } from '@nestjs/common';
+ import { ConfigModule, ConfigType } from '@nestjs/config';
++import { APP_GUARD } from '@nestjs/core';
++import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+ import { TypeOrmModule } from '@nestjs/typeorm';
+ 
++import authConfig from './config/auth.config';
+ import databaseConfig from './config/database.config';
++import { ENTITIES } from './database/entities';
++import { AuthModule } from './modules/auth/auth.module';
+ import { WalletModule } from './modules/wallet/wallet.module';
+ import { ProviderModule } from './modules/providers/provider.module';
+ import { RoutingModule } from './modules/routing/routing.module';
+@@ -11,9 +16,13 @@ import { RoutingModule } from './modules/routing/routing.module';
+   imports: [
+     ConfigModule.forRoot({
+       isGlobal: true,
+-      load: [databaseConfig],
++      load: [databaseConfig, authConfig],
+     }),
+ 
++    // Default per-IP limit for every route; auth routes set stricter ones.
++    ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }]),
++
++    AuthModule,
+     WalletModule,
+     ProviderModule,
+     RoutingModule,
+@@ -32,7 +41,7 @@ import { RoutingModule } from './modules/routing/routing.module';
+           password,
+           database,
+ 
+-          autoLoadEntities: true,
++          entities: ENTITIES,
+ 
+           //Schema changes will be handled through migrations.
+           synchronize: false,
+@@ -40,5 +49,6 @@ import { RoutingModule } from './modules/routing/routing.module';
+       },
+     }),
+   ],
++  providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
+ })
+ export class AppModule {}
+diff --git a/apps/api/src/config/auth.config.spec.ts b/apps/api/src/config/auth.config.spec.ts
+new file mode 100644
+index 0000000..903ee48
+--- /dev/null
++++ b/apps/api/src/config/auth.config.spec.ts
+@@ -0,0 +1,58 @@
++import authConfig from './auth.config';
++
++const STRONG_A = 'a'.repeat(40);
++const STRONG_B = 'b'.repeat(40);
++
++describe('auth config', () => {
++  const original = { ...process.env };
++
++  beforeEach(() => {
++    process.env.JWT_ACCESS_SECRET = STRONG_A;
++    process.env.JWT_REFRESH_SECRET = STRONG_B;
++    delete process.env.JWT_ACCESS_TTL_SECONDS;
++    delete process.env.REFRESH_TOKEN_TTL_DAYS;
++    delete process.env.BCRYPT_ROUNDS;
++  });
++
++  afterAll(() => {
++    process.env = original;
++  });
++
++  it('loads secure defaults', () => {
++    expect(authConfig()).toEqual({
++      accessSecret: STRONG_A,
++      refreshSecret: STRONG_B,
++      accessTtlSeconds: 900,
++      refreshTtlDays: 30,
++      bcryptRounds: 12,
++    });
++  });
++
++  it.each(['JWT_ACCESS_SECRET', 'JWT_REFRESH_SECRET'])(
++    'refuses to start when %s is missing',
++    (name) => {
++      delete process.env[name];
++      expect(() => authConfig()).toThrow(name);
++    },
++  );
++
++  it('refuses a short secret', () => {
++    process.env.JWT_ACCESS_SECRET = 'too-short';
++    expect(() => authConfig()).toThrow(/at least 32/);
++  });
++
++  it('refuses identical access and refresh secrets', () => {
++    process.env.JWT_REFRESH_SECRET = STRONG_A;
++    expect(() => authConfig()).toThrow(/must be different/);
++  });
++
++  it.each([
++    ['BCRYPT_ROUNDS', '3'],
++    ['BCRYPT_ROUNDS', 'abc'],
++    ['JWT_ACCESS_TTL_SECONDS', '5'],
++    ['REFRESH_TOKEN_TTL_DAYS', '0'],
++  ])('rejects out-of-range %s=%s', (name, value) => {
++    process.env[name] = value;
++    expect(() => authConfig()).toThrow(name);
++  });
++});
+diff --git a/apps/api/src/config/auth.config.ts b/apps/api/src/config/auth.config.ts
+new file mode 100644
+index 0000000..956b993
+--- /dev/null
++++ b/apps/api/src/config/auth.config.ts
+@@ -0,0 +1,56 @@
++import { registerAs } from '@nestjs/config';
++
++const MIN_SECRET_LENGTH = 32;
++
++function readSecret(name: string): string {
++  const value = process.env[name];
++
++  if (!value || value.length < MIN_SECRET_LENGTH) {
++    throw new Error(
++      `${name} must be set to a random string of at least ${MIN_SECRET_LENGTH} characters ` +
++        '(generate one with: openssl rand -base64 48)',
++    );
++  }
++
++  return value;
++}
++
++function readInt(name: string, fallback: number, min: number, max: number) {
++  const raw = process.env[name];
++
++  if (raw === undefined || raw === '') {
++    return fallback;
++  }
++
++  const value = Number(raw);
++
++  if (!Number.isInteger(value) || value < min || value > max) {
++    throw new Error(`${name} must be an integer between ${min} and ${max}`);
++  }
++
++  return value;
++}
++
++/**
++ * Evaluated while the config module loads, so a missing or weak secret stops
++ * the application from booting instead of failing on the first login.
++ */
++export default registerAs('auth', () => {
++  const accessSecret = readSecret('JWT_ACCESS_SECRET');
++  const refreshSecret = readSecret('JWT_REFRESH_SECRET');
++
++  if (accessSecret === refreshSecret) {
++    throw new Error(
++      'JWT_ACCESS_SECRET and JWT_REFRESH_SECRET must be different',
++    );
++  }
++
++  return {
++    accessSecret,
++    // Keys the HMAC that hashes refresh tokens before they are stored.
++    refreshSecret,
++    accessTtlSeconds: readInt('JWT_ACCESS_TTL_SECONDS', 15 * 60, 60, 24 * 3600),
++    refreshTtlDays: readInt('REFRESH_TOKEN_TTL_DAYS', 30, 1, 365),
++    bcryptRounds: readInt('BCRYPT_ROUNDS', 12, 4, 15),
++  };
++});
+diff --git a/apps/api/src/database/entities/index.ts b/apps/api/src/database/entities/index.ts
+new file mode 100644
+index 0000000..8396f8f
+--- /dev/null
++++ b/apps/api/src/database/entities/index.ts
+@@ -0,0 +1,31 @@
++import { AuthIdentity } from './auth-identity.entity';
++import { FinancialAccount } from './financial-account.entity';
++import { IdentityVerification } from './identity-verification.entity';
++import { LedgerEntry } from './ledger-entry.entity';
++import { ProviderCapabilityEntity } from './provider-capability.entity';
++import { Provider } from './provider.entity';
++import { RefreshToken } from './refresh-token.entity';
++import { TransactionAttempt } from './transaction-attempt.entity';
++import { Transaction } from './transaction.entity';
++import { User } from './user.entity';
++import { Wallet } from './wallet.entity';
++
++/**
++ * Every entity, registered explicitly with the application's data source.
++ * `autoLoadEntities` alone is not enough: it only picks up entities that some
++ * module lists in TypeOrmModule.forFeature(), so relations to any other entity
++ * fail with "Entity metadata ... was not found" at startup.
++ */
++export const ENTITIES = [
++  AuthIdentity,
++  FinancialAccount,
++  IdentityVerification,
++  LedgerEntry,
++  Provider,
++  ProviderCapabilityEntity,
++  RefreshToken,
++  Transaction,
++  TransactionAttempt,
++  User,
++  Wallet,
++];
+diff --git a/apps/api/src/database/entities/refresh-token.entity.ts b/apps/api/src/database/entities/refresh-token.entity.ts
+new file mode 100644
+index 0000000..0ec09d4
+--- /dev/null
++++ b/apps/api/src/database/entities/refresh-token.entity.ts
+@@ -0,0 +1,50 @@
++import {
++  Column,
++  Entity,
++  Index,
++  JoinColumn,
++  ManyToOne,
++  Relation,
++} from 'typeorm';
++
++import { BaseEntity } from './base.entity';
++import { User } from './user.entity';
++
++/**
++ * One row per issued refresh token. Tokens are rotated on every use; all
++ * tokens descended from one login share a `familyId`, so a replayed (already
++ * rotated) token can revoke the whole session at once.
++ */
++@Entity('refresh_tokens')
++@Index(['userId'])
++@Index(['familyId'])
++export class RefreshToken extends BaseEntity {
++  @Column({ type: 'uuid' })
++  userId!: string;
++
++  @ManyToOne(() => User, { onDelete: 'CASCADE' })
++  @JoinColumn({ name: 'userId' })
++  user!: Relation<User>;
++
++  @Column({ type: 'uuid' })
++  familyId!: string;
++
++  /** HMAC-SHA256 of the token. The raw token is never stored. */
++  @Column({ type: 'varchar', unique: true })
++  tokenHash!: string;
++
++  @Column({ type: 'timestamptz' })
++  expiresAt!: Date;
++
++  @Column({ type: 'timestamptz', nullable: true })
++  revokedAt!: Date | null;
++
++  @Column({ type: 'uuid', nullable: true })
++  replacedByTokenId!: string | null;
++
++  @Column({ type: 'varchar', nullable: true })
++  ipAddress!: string | null;
++
++  @Column({ type: 'varchar', nullable: true })
++  userAgent!: string | null;
++}
+diff --git a/apps/api/src/database/migrations/1790881692468-AddRefreshTokens.ts b/apps/api/src/database/migrations/1790881692468-AddRefreshTokens.ts
+new file mode 100644
+index 0000000..6585837
+--- /dev/null
++++ b/apps/api/src/database/migrations/1790881692468-AddRefreshTokens.ts
+@@ -0,0 +1,20 @@
++import { MigrationInterface, QueryRunner } from "typeorm";
++
++export class AddRefreshTokens1790881692468 implements MigrationInterface {
++    name = 'AddRefreshTokens1790881692468'
++
++    public async up(queryRunner: QueryRunner): Promise<void> {
++        await queryRunner.query(`CREATE TABLE "refresh_tokens" ("id" uuid NOT NULL DEFAULT uuid_generate_v4(), "createdAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(), "updatedAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(), "userId" uuid NOT NULL, "familyId" uuid NOT NULL, "tokenHash" character varying NOT NULL, "expiresAt" TIMESTAMP WITH TIME ZONE NOT NULL, "revokedAt" TIMESTAMP WITH TIME ZONE, "replacedByTokenId" uuid, "ipAddress" character varying, "userAgent" character varying, CONSTRAINT "UQ_c25bc63d248ca90e8dcc1d92d06" UNIQUE ("tokenHash"), CONSTRAINT "PK_7d8bee0204106019488c4c50ffa" PRIMARY KEY ("id"))`);
++        await queryRunner.query(`CREATE INDEX "IDX_40e9a8b923a1b3fb4429a5c624" ON "refresh_tokens"  ("familyId") `);
++        await queryRunner.query(`CREATE INDEX "IDX_610102b60fea1455310ccd299d" ON "refresh_tokens"  ("userId") `);
++        await queryRunner.query(`ALTER TABLE "refresh_tokens" ADD CONSTRAINT "FK_610102b60fea1455310ccd299de" FOREIGN KEY ("userId") REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE NO ACTION`);
++    }
++
++    public async down(queryRunner: QueryRunner): Promise<void> {
++        await queryRunner.query(`ALTER TABLE "refresh_tokens" DROP CONSTRAINT "FK_610102b60fea1455310ccd299de"`);
++        await queryRunner.query(`DROP INDEX "public"."IDX_610102b60fea1455310ccd299d"`);
++        await queryRunner.query(`DROP INDEX "public"."IDX_40e9a8b923a1b3fb4429a5c624"`);
++        await queryRunner.query(`DROP TABLE "refresh_tokens"`);
++    }
++
++}
+diff --git a/apps/api/src/modules/auth/auth.controller.ts b/apps/api/src/modules/auth/auth.controller.ts
+new file mode 100644
+index 0000000..3d8613b
+--- /dev/null
++++ b/apps/api/src/modules/auth/auth.controller.ts
+@@ -0,0 +1,103 @@
++import {
++  Body,
++  Controller,
++  Get,
++  Headers,
++  HttpCode,
++  HttpStatus,
++  Ip,
++  Post,
++} from '@nestjs/common';
++import { Throttle } from '@nestjs/throttler';
++
++import { AuthService } from './auth.service';
++import { AuthResponse, AuthenticatedUser, UserProfile } from './auth.types';
++import { CurrentUser, Public } from './decorators/auth.decorators';
++import {
++  ChangePasswordDto,
++  LoginDto,
++  RefreshTokenDto,
++  RegisterDto,
++} from './dto/auth.dto';
++
++// Per-IP limits. In-memory, so each API instance counts separately; move the
++// throttler to a Redis store before running more than one instance.
++const STRICT = { default: { limit: 5, ttl: 60_000 } };
++const REFRESH = { default: { limit: 20, ttl: 60_000 } };
++
++@Controller('auth')
++export class AuthController {
++  constructor(private readonly auth: AuthService) {}
++
++  @Public()
++  @Throttle(STRICT)
++  @Post('register')
++  register(
++    @Body() dto: RegisterDto,
++    @Ip() ip: string,
++    @Headers('user-agent') userAgent?: string,
++  ): Promise<AuthResponse> {
++    return this.auth.register(dto, { ip, userAgent });
++  }
++
++  @Public()
++  @Throttle(STRICT)
++  @HttpCode(HttpStatus.OK)
++  @Post('login')
++  login(
++    @Body() dto: LoginDto,
++    @Ip() ip: string,
++    @Headers('user-agent') userAgent?: string,
++  ): Promise<AuthResponse> {
++    return this.auth.login(dto.email, dto.password, { ip, userAgent });
++  }
++
++  @Public()
++  @Throttle(REFRESH)
++  @HttpCode(HttpStatus.OK)
++  @Post('refresh')
++  refresh(
++    @Body() dto: RefreshTokenDto,
++    @Ip() ip: string,
++    @Headers('user-agent') userAgent?: string,
++  ): Promise<AuthResponse> {
++    return this.auth.refresh(dto.refreshToken, { ip, userAgent });
++  }
++
++  /** Public on purpose: the access token may already have expired. */
++  @Public()
++  @Throttle(REFRESH)
++  @HttpCode(HttpStatus.NO_CONTENT)
++  @Post('logout')
++  logout(@Body() dto: RefreshTokenDto): Promise<void> {
++    return this.auth.logout(dto.refreshToken);
++  }
++
++  @HttpCode(HttpStatus.NO_CONTENT)
++  @Post('logout-all')
++  logoutAll(@CurrentUser() user: AuthenticatedUser): Promise<void> {
++    return this.auth.logoutAll(user.id);
++  }
++
++  @Throttle(STRICT)
++  @HttpCode(HttpStatus.OK)
++  @Post('change-password')
++  changePassword(
++    @CurrentUser() user: AuthenticatedUser,
++    @Body() dto: ChangePasswordDto,
++    @Ip() ip: string,
++    @Headers('user-agent') userAgent?: string,
++  ): Promise<AuthResponse> {
++    return this.auth.changePassword(
++      user.id,
++      dto.currentPassword,
++      dto.newPassword,
++      { ip, userAgent },
++    );
++  }
++
++  @Get('me')
++  me(@CurrentUser() user: AuthenticatedUser): Promise<UserProfile> {
++    return this.auth.getProfile(user.id);
++  }
++}
+diff --git a/apps/api/src/modules/auth/auth.http.int-spec.ts b/apps/api/src/modules/auth/auth.http.int-spec.ts
+new file mode 100644
+index 0000000..ae7bb87
+--- /dev/null
++++ b/apps/api/src/modules/auth/auth.http.int-spec.ts
+@@ -0,0 +1,502 @@
++/* supertest response bodies are untyped JSON, which is the point of these tests. */
++/* eslint-disable @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-argument */
++import {
++  Controller,
++  DynamicModule,
++  Get,
++  INestApplication,
++  Module,
++  ValidationPipe,
++} from '@nestjs/common';
++import { APP_GUARD } from '@nestjs/core';
++import { JwtService } from '@nestjs/jwt';
++import { Test } from '@nestjs/testing';
++import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
++import { ConfigModule } from '@nestjs/config';
++import request from 'supertest';
++import { DataSource } from 'typeorm';
++
++import authConfig from '../../config/auth.config';
++import { User } from '../../database/entities/user.entity';
++import { UserRole } from '../../database/enums/user-role.enum';
++import { TEST_AUTH_CONFIG, uniqueEmail } from '../../testing/test-auth';
++import { createTestDataSource } from '../../testing/test-database';
++import { AuthModule } from './auth.module';
++import { AuthenticatedUser } from './auth.types';
++import { CurrentUser, Public, Roles } from './decorators/auth.decorators';
++
++jest.setTimeout(30_000);
++
++const PASSWORD = 'correct horse 9';
++
++// Stand-in routes that exercise the global guards the way real modules will.
++@Controller('probe')
++class ProbeController {
++  @Public()
++  @Get('open')
++  open() {
++    return { ok: true };
++  }
++
++  @Get('private')
++  private(@CurrentUser() user: AuthenticatedUser) {
++    return user;
++  }
++
++  @Roles(UserRole.ADMIN)
++  @Get('admin')
++  admin() {
++    return { ok: true };
++  }
++}
++
++function dataSourceModule(dataSource: DataSource): DynamicModule {
++  @Module({})
++  class TestDataSourceModule {}
++
++  return {
++    module: TestDataSourceModule,
++    global: true,
++    providers: [{ provide: DataSource, useValue: dataSource }],
++    exports: [DataSource],
++  };
++}
++
++async function createApp(
++  dataSource: DataSource,
++  options: { throttle: boolean },
++): Promise<INestApplication> {
++  const moduleRef = await Test.createTestingModule({
++    imports: [
++      ConfigModule.forRoot({
++        isGlobal: true,
++        ignoreEnvFile: true,
++        load: [authConfig],
++      }),
++      ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }]),
++      dataSourceModule(dataSource),
++      AuthModule,
++    ],
++    controllers: [ProbeController],
++    providers: options.throttle
++      ? [{ provide: APP_GUARD, useClass: ThrottlerGuard }]
++      : [],
++  }).compile();
++
++  const app = moduleRef.createNestApplication();
++  // Same pipe as main.ts.
++  app.useGlobalPipes(
++    new ValidationPipe({
++      whitelist: true,
++      transform: true,
++      forbidNonWhitelisted: true,
++    }),
++  );
++  await app.init();
++  return app;
++}
++
++describe('auth over HTTP (real Postgres)', () => {
++  const original = { ...process.env };
++  let dataSource: DataSource;
++  let app: INestApplication;
++  const jwt = new JwtService({});
++
++  beforeAll(async () => {
++    process.env.JWT_ACCESS_SECRET = TEST_AUTH_CONFIG.accessSecret;
++    process.env.JWT_REFRESH_SECRET = TEST_AUTH_CONFIG.refreshSecret;
++    process.env.BCRYPT_ROUNDS = '4';
++
++    dataSource = await createTestDataSource();
++    app = await createApp(dataSource, { throttle: false });
++  });
++
++  afterAll(async () => {
++    await app.close();
++    await dataSource.destroy();
++    process.env = original;
++  });
++
++  const http = () => request(app.getHttpServer());
++
++  async function registerUser() {
++    const email = uniqueEmail();
++    const res = await http()
++      .post('/auth/register')
++      .send({ email, password: PASSWORD })
++      .expect(201);
++    return {
++      email,
++      user: res.body.user as { id: string; email: string },
++      accessToken: res.body.tokens.accessToken as string,
++      refreshToken: res.body.tokens.refreshToken as string,
++    };
++  }
++
++  describe('route protection', () => {
++    it('serves @Public() routes without a token', async () => {
++      await http().get('/probe/open').expect(200);
++    });
++
++    it('protects every other route by default', async () => {
++      await http().get('/probe/private').expect(401);
++      await http().get('/auth/me').expect(401);
++    });
++
++    it('exposes the authenticated user to handlers', async () => {
++      const { accessToken, user } = await registerUser();
++      const res = await http()
++        .get('/probe/private')
++        .set('Authorization', `Bearer ${accessToken}`)
++        .expect(200);
++
++      expect(res.body).toEqual({
++        id: user.id,
++        email: user.email,
++        role: 'USER',
++      });
++    });
++
++    it.each([
++      ['no scheme', 'sometoken'],
++      ['Basic scheme', 'Basic dXNlcjpwYXNz'],
++      ['extra parts', 'Bearer a b'],
++      ['garbage token', 'Bearer not.a.jwt'],
++    ])('rejects a malformed Authorization header (%s)', async (_n, header) => {
++      await http().get('/auth/me').set('Authorization', header).expect(401);
++    });
++  });
++
++  describe('token forgery', () => {
++    const bearer = (token: string) => `Bearer ${token}`;
++
++    it('rejects a token signed with another secret', async () => {
++      const { user } = await registerUser();
++      const forged = await jwt.signAsync(
++        { sub: user.id, typ: 'access' },
++        {
++          secret: 'attacker-secret-attacker-secret-attacker-secret',
++          issuer: 'data-app-api',
++          audience: 'data-app-clients',
++        },
++      );
++      await http()
++        .get('/auth/me')
++        .set('Authorization', bearer(forged))
++        .expect(401);
++    });
++
++    it('rejects an expired token', async () => {
++      const { user } = await registerUser();
++      const expired = await jwt.signAsync(
++        { sub: user.id, typ: 'access' },
++        {
++          secret: TEST_AUTH_CONFIG.accessSecret,
++          issuer: 'data-app-api',
++          audience: 'data-app-clients',
++          expiresIn: -10,
++        },
++      );
++      await http()
++        .get('/auth/me')
++        .set('Authorization', bearer(expired))
++        .expect(401);
++    });
++
++    it('rejects an unsigned token (alg: none)', async () => {
++      const { user } = await registerUser();
++      const b64 = (o: object) =>
++        Buffer.from(JSON.stringify(o)).toString('base64url');
++      const unsigned = `${b64({ alg: 'none', typ: 'JWT' })}.${b64({
++        sub: user.id,
++        typ: 'access',
++        iss: 'data-app-api',
++        aud: 'data-app-clients',
++        exp: Math.floor(Date.now() / 1000) + 600,
++      })}.`;
++      await http()
++        .get('/auth/me')
++        .set('Authorization', bearer(unsigned))
++        .expect(401);
++    });
++
++    it('rejects a token with the wrong audience or token type', async () => {
++      const { user } = await registerUser();
++      const sign = (claims: Record<string, unknown>, audience: string) =>
++        jwt.signAsync(claims, {
++          secret: TEST_AUTH_CONFIG.accessSecret,
++          issuer: 'data-app-api',
++          audience,
++        });
++
++      await http()
++        .get('/auth/me')
++        .set(
++          'Authorization',
++          bearer(await sign({ sub: user.id, typ: 'access' }, 'someone-else')),
++        )
++        .expect(401);
++      await http()
++        .get('/auth/me')
++        .set(
++          'Authorization',
++          bearer(
++            await sign({ sub: user.id, typ: 'refresh' }, 'data-app-clients'),
++          ),
++        )
++        .expect(401);
++    });
++
++    it('rejects a refresh token used as an access token', async () => {
++      const { refreshToken } = await registerUser();
++      await http()
++        .get('/auth/me')
++        .set('Authorization', bearer(refreshToken))
++        .expect(401);
++    });
++  });
++
++  describe('account state is checked on every request', () => {
++    it('locks out a user the moment they are disabled', async () => {
++      const { accessToken, user } = await registerUser();
++      await http()
++        .get('/auth/me')
++        .set('Authorization', `Bearer ${accessToken}`)
++        .expect(200);
++
++      await dataSource.getRepository(User).update(user.id, { isActive: false });
++
++      await http()
++        .get('/auth/me')
++        .set('Authorization', `Bearer ${accessToken}`)
++        .expect(401);
++    });
++
++    it('applies a role change without waiting for a new token', async () => {
++      const { accessToken, user } = await registerUser();
++      const auth = { Authorization: `Bearer ${accessToken}` };
++
++      await http().get('/probe/admin').set(auth).expect(403);
++      await dataSource
++        .getRepository(User)
++        .update(user.id, { role: UserRole.ADMIN });
++      await http().get('/probe/admin').set(auth).expect(200);
++    });
++
++    it('requires authentication before role checks', async () => {
++      await http().get('/probe/admin').expect(401);
++    });
++  });
++
++  describe('input validation', () => {
++    const register = (body: object) => http().post('/auth/register').send(body);
++
++    it.each([
++      ['invalid email', { email: 'nope', password: PASSWORD }],
++      ['missing password', { email: uniqueEmail() }],
++      ['password too short', { email: uniqueEmail(), password: 'short' }],
++      [
++        'password over 72 bytes (multi-byte)',
++        { email: uniqueEmail(), password: 'é'.repeat(37) },
++      ],
++      [
++        'invalid phone',
++        { email: uniqueEmail(), password: PASSWORD, phoneNumber: '12345' },
++      ],
++      [
++        'unknown field',
++        { email: uniqueEmail(), password: PASSWORD, isAdmin: true },
++      ],
++      [
++        'self-assigned role',
++        { email: uniqueEmail(), password: PASSWORD, role: 'ADMIN' },
++      ],
++      ['non-string password', { email: uniqueEmail(), password: 12345678 }],
++    ])('rejects %s', async (_name, body) => {
++      await register(body).expect(400);
++    });
++
++    it('accepts Nigerian numbers in local and international format', async () => {
++      const a = await register({
++        email: uniqueEmail(),
++        password: PASSWORD,
++        phoneNumber: '0803 000 0000',
++      }).expect(201);
++      const b = await register({
++        email: uniqueEmail(),
++        password: PASSWORD,
++        phoneNumber: '+2348030000000',
++      }).expect(201);
++
++      expect(a.body.user.phoneNumber).toBe('08030000000');
++      expect(b.body.user.phoneNumber).toBe('+2348030000000');
++    });
++
++    it('never returns password hashes or token hashes', async () => {
++      const email = uniqueEmail();
++      const res = await register({ email, password: PASSWORD }).expect(201);
++      const body = JSON.stringify(res.body);
++
++      expect(body).not.toMatch(/passwordHash|tokenHash|\$2[aby]\$/);
++      expect(Object.keys(res.body.user).sort()).toEqual([
++        'createdAt',
++        'email',
++        'id',
++        'phoneNumber',
++        'role',
++      ]);
++    });
++
++    it('rejects a bad refresh payload', async () => {
++      await http().post('/auth/refresh').send({}).expect(400);
++      await http()
++        .post('/auth/refresh')
++        .send({ refreshToken: 123 })
++        .expect(400);
++    });
++  });
++
++  describe('login', () => {
++    it('answers 401 with an identical body for a bad password and an unknown email', async () => {
++      const { email } = await registerUser();
++
++      const wrong = await http()
++        .post('/auth/login')
++        .send({ email, password: 'wrong' })
++        .expect(401);
++      const unknown = await http()
++        .post('/auth/login')
++        .send({ email: uniqueEmail('ghost'), password: 'wrong' })
++        .expect(401);
++
++      expect(wrong.body).toEqual(unknown.body);
++    });
++
++    it('answers 200 with a usable session', async () => {
++      const { email } = await registerUser();
++      const res = await http()
++        .post('/auth/login')
++        .send({ email, password: PASSWORD })
++        .expect(200);
++
++      await http()
++        .get('/auth/me')
++        .set('Authorization', `Bearer ${res.body.tokens.accessToken}`)
++        .expect(200);
++    });
++
++    it('returns 403 for a disabled account with the right password only', async () => {
++      const { email, user } = await registerUser();
++      await dataSource.getRepository(User).update(user.id, { isActive: false });
++
++      await http()
++        .post('/auth/login')
++        .send({ email, password: PASSWORD })
++        .expect(403);
++      await http()
++        .post('/auth/login')
++        .send({ email, password: 'wrong' })
++        .expect(401);
++    });
++  });
++
++  describe('session lifecycle', () => {
++    it('rotates refresh tokens and detects replay', async () => {
++      const { refreshToken } = await registerUser();
++
++      const rotated = await http()
++        .post('/auth/refresh')
++        .send({ refreshToken })
++        .expect(200);
++      await http().post('/auth/refresh').send({ refreshToken }).expect(401);
++      await http()
++        .post('/auth/refresh')
++        .send({ refreshToken: rotated.body.tokens.refreshToken })
++        .expect(401);
++    });
++
++    it('logs out with 204, even for an unknown token', async () => {
++      const { refreshToken } = await registerUser();
++
++      await http().post('/auth/logout').send({ refreshToken }).expect(204);
++      await http().post('/auth/refresh').send({ refreshToken }).expect(401);
++      await http()
++        .post('/auth/logout')
++        .send({ refreshToken: 'unknown' })
++        .expect(204);
++    });
++
++    it('logs out everywhere with an access token', async () => {
++      const { email, accessToken, refreshToken } = await registerUser();
++      const other = await http()
++        .post('/auth/login')
++        .send({ email, password: PASSWORD })
++        .expect(200);
++
++      await http().post('/auth/logout-all').expect(401);
++      await http()
++        .post('/auth/logout-all')
++        .set('Authorization', `Bearer ${accessToken}`)
++        .expect(204);
++
++      await http().post('/auth/refresh').send({ refreshToken }).expect(401);
++      await http()
++        .post('/auth/refresh')
++        .send({ refreshToken: other.body.tokens.refreshToken })
++        .expect(401);
++    });
++
++    it('changes the password and replaces the session', async () => {
++      const { email, accessToken, refreshToken } = await registerUser();
++      const auth = { Authorization: `Bearer ${accessToken}` };
++
++      await http()
++        .post('/auth/change-password')
++        .set(auth)
++        .send({ currentPassword: 'wrong', newPassword: 'a brand new pass 1' })
++        .expect(400);
++
++      const res = await http()
++        .post('/auth/change-password')
++        .set(auth)
++        .send({ currentPassword: PASSWORD, newPassword: 'a brand new pass 1' })
++        .expect(200);
++
++      await http()
++        .post('/auth/login')
++        .send({ email, password: PASSWORD })
++        .expect(401);
++      await http()
++        .post('/auth/login')
++        .send({ email, password: 'a brand new pass 1' })
++        .expect(200);
++      await http().post('/auth/refresh').send({ refreshToken }).expect(401);
++      await http()
++        .get('/auth/me')
++        .set('Authorization', `Bearer ${res.body.tokens.accessToken}`)
++        .expect(200);
++    });
++  });
++
++  describe('rate limiting', () => {
++    it('answers 429 after 5 login attempts a minute from one address', async () => {
++      const throttled = await createApp(dataSource, { throttle: true });
++
++      try {
++        const attempt = () =>
++          request(throttled.getHttpServer())
++            .post('/auth/login')
++            .send({ email: uniqueEmail('brute'), password: 'guess' });
++
++        const statuses: number[] = [];
++        for (let i = 0; i < 7; i++) {
++          statuses.push((await attempt()).status);
++        }
++
++        expect(statuses).toEqual([401, 401, 401, 401, 401, 429, 429]);
++      } finally {
++        await throttled.close();
++      }
++    });
++  });
++});
+diff --git a/apps/api/src/modules/auth/auth.module.ts b/apps/api/src/modules/auth/auth.module.ts
+new file mode 100644
+index 0000000..1c5d24e
+--- /dev/null
++++ b/apps/api/src/modules/auth/auth.module.ts
+@@ -0,0 +1,26 @@
++import { Module } from '@nestjs/common';
++import { APP_GUARD } from '@nestjs/core';
++import { JwtModule } from '@nestjs/jwt';
++
++import { AuthController } from './auth.controller';
++import { AuthService } from './auth.service';
++import { JwtAuthGuard } from './guards/jwt-auth.guard';
++import { RolesGuard } from './guards/roles.guard';
++import { PasswordService } from './password.service';
++import { TokenService } from './token.service';
++
++@Module({
++  // Secrets and lifetimes are passed per call by TokenService from auth config.
++  imports: [JwtModule.register({})],
++  controllers: [AuthController],
++  providers: [
++    AuthService,
++    PasswordService,
++    TokenService,
++    // Global and ordered: authenticate first, then check roles.
++    { provide: APP_GUARD, useClass: JwtAuthGuard },
++    { provide: APP_GUARD, useClass: RolesGuard },
++  ],
++  exports: [AuthService, TokenService],
++})
++export class AuthModule {}
+diff --git a/apps/api/src/modules/auth/auth.service.int-spec.ts b/apps/api/src/modules/auth/auth.service.int-spec.ts
+new file mode 100644
+index 0000000..e395ba1
+--- /dev/null
++++ b/apps/api/src/modules/auth/auth.service.int-spec.ts
+@@ -0,0 +1,336 @@
++import { HttpException } from '@nestjs/common';
++import { DataSource, IsNull } from 'typeorm';
++
++import { AuthIdentity } from '../../database/entities/auth-identity.entity';
++import { RefreshToken } from '../../database/entities/refresh-token.entity';
++import { User } from '../../database/entities/user.entity';
++import { Wallet } from '../../database/entities/wallet.entity';
++import { createTestDataSource } from '../../testing/test-database';
++import { createAuthServices, uniqueEmail } from '../../testing/test-auth';
++import { AuthService } from './auth.service';
++import { TokenService } from './token.service';
++
++jest.setTimeout(30_000);
++
++const PASSWORD = 'correct horse 9';
++
++/** Resolves with the rejection, and fails the test if the call succeeds. */
++const failure = (promise: Promise<unknown>): Promise<HttpException> =>
++  promise.then(
++    () => {
++      throw new Error('Expected the call to be rejected');
++    },
++    (error: HttpException) => error,
++  );
++
++describe('AuthService (real Postgres)', () => {
++  let dataSource: DataSource;
++  let auth: AuthService;
++  let tokens: TokenService;
++
++  beforeAll(async () => {
++    dataSource = await createTestDataSource();
++    ({ auth, tokens } = createAuthServices(dataSource));
++  });
++
++  afterAll(async () => {
++    await dataSource.destroy();
++  });
++
++  const tokenRow = (rawToken: string) =>
++    dataSource
++      .getRepository(RefreshToken)
++      .findOneByOrFail({ tokenHash: tokens.hashRefreshToken(rawToken) });
++
++  const familyRows = (familyId: string) =>
++    dataSource.getRepository(RefreshToken).findBy({ familyId });
++
++  async function registerUser() {
++    const email = uniqueEmail();
++    const result = await auth.register({ email, password: PASSWORD });
++    return { email, ...result };
++  }
++
++  describe('register', () => {
++    it('creates the user, password identity, wallet and session together', async () => {
++      const { user, tokens: issued } = await registerUser();
++
++      const identity = await dataSource
++        .getRepository(AuthIdentity)
++        .findOneByOrFail({ userId: user.id });
++      const wallet = await dataSource
++        .getRepository(Wallet)
++        .findOneByOrFail({ userId: user.id });
++
++      expect(identity.passwordHash).toMatch(/^\$2[aby]\$04\$/);
++      expect(identity.passwordHash).not.toContain(PASSWORD);
++      expect(wallet).toMatchObject({ balance: '0.00', currency: 'NGN' });
++      expect(user.role).toBe('USER');
++      expect(issued.expiresIn).toBe(900);
++      expect(await tokenRow(issued.refreshToken)).toMatchObject({
++        userId: user.id,
++        revokedAt: null,
++      });
++    });
++
++    it('never stores the raw refresh token', async () => {
++      const { user, tokens: issued } = await registerUser();
++      const rows = await dataSource
++        .getRepository(RefreshToken)
++        .findBy({ userId: user.id });
++
++      expect(rows.map((r) => r.tokenHash)).not.toContain(issued.refreshToken);
++      expect(rows[0].tokenHash).toHaveLength(64);
++    });
++
++    it('normalizes the email and rejects case-variant duplicates', async () => {
++      const email = uniqueEmail('Mixed');
++      const first = await auth.register({
++        email: `  ${email.toUpperCase()} `,
++        password: PASSWORD,
++      });
++
++      expect(first.user.email).toBe(email.toLowerCase());
++      await expect(
++        auth.register({ email, password: PASSWORD }),
++      ).rejects.toThrow(/already exists/);
++    });
++
++    it('leaves no partial rows when the email is taken', async () => {
++      const { email } = await registerUser();
++      const before = await dataSource.getRepository(Wallet).count();
++
++      await expect(
++        auth.register({ email, password: PASSWORD }),
++      ).rejects.toThrow();
++
++      expect(await dataSource.getRepository(Wallet).count()).toBe(before);
++      expect(await dataSource.getRepository(User).countBy({ email })).toBe(1);
++    });
++
++    it('creates exactly one account when the same email races', async () => {
++      const email = uniqueEmail('race');
++
++      const outcomes = await Promise.allSettled(
++        Array.from({ length: 6 }, () =>
++          auth.register({ email, password: PASSWORD }),
++        ),
++      );
++
++      expect(outcomes.filter((o) => o.status === 'fulfilled')).toHaveLength(1);
++      expect(await dataSource.getRepository(User).countBy({ email })).toBe(1);
++      const user = await dataSource
++        .getRepository(User)
++        .findOneByOrFail({ email });
++      expect(
++        await dataSource.getRepository(Wallet).countBy({ userId: user.id }),
++      ).toBe(1);
++    });
++  });
++
++  describe('login', () => {
++    it('returns tokens for correct credentials, any email casing', async () => {
++      const { email, user } = await registerUser();
++      const result = await auth.login(email.toUpperCase(), PASSWORD);
++
++      expect(result.user.id).toBe(user.id);
++      await expect(
++        tokens.verifyAccessToken(result.tokens.accessToken),
++      ).resolves.toBe(user.id);
++    });
++
++    it('gives the same error for a wrong password and an unknown email', async () => {
++      const { email } = await registerUser();
++
++      const wrongPassword = await failure(auth.login(email, 'nope'));
++      const unknownEmail = await failure(
++        auth.login(uniqueEmail('ghost'), PASSWORD),
++      );
++
++      expect(wrongPassword.getStatus()).toBe(401);
++      expect(unknownEmail.getStatus()).toBe(401);
++      expect(wrongPassword.message).toBe(unknownEmail.message);
++    });
++
++    it('starts a separate session family per login', async () => {
++      const { email } = await registerUser();
++      const a = await auth.login(email, PASSWORD);
++      const b = await auth.login(email, PASSWORD);
++
++      const rowA = await tokenRow(a.tokens.refreshToken);
++      const rowB = await tokenRow(b.tokens.refreshToken);
++      expect(rowA.familyId).not.toBe(rowB.familyId);
++    });
++
++    it('rejects a disabled account only when the password is right', async () => {
++      const { email, user } = await registerUser();
++      await dataSource.getRepository(User).update(user.id, { isActive: false });
++
++      await expect(auth.login(email, PASSWORD)).rejects.toThrow(/disabled/);
++      await expect(auth.login(email, 'wrong')).rejects.toThrow(
++        /Invalid email or password/,
++      );
++    });
++  });
++
++  describe('refresh', () => {
++    it('rotates: the old token is retired and the new one stays in the family', async () => {
++      const { tokens: first } = await registerUser();
++      const next = await auth.refresh(first.refreshToken);
++
++      expect(next.tokens.refreshToken).not.toBe(first.refreshToken);
++
++      const oldRow = await tokenRow(first.refreshToken);
++      const newRow = await tokenRow(next.tokens.refreshToken);
++      expect(oldRow.revokedAt).not.toBeNull();
++      expect(oldRow.replacedByTokenId).toBe(newRow.id);
++      expect(newRow.familyId).toBe(oldRow.familyId);
++      expect(newRow.revokedAt).toBeNull();
++    });
++
++    it('keeps working down a chain of rotations', async () => {
++      let current = (await registerUser()).tokens;
++      for (let i = 0; i < 4; i++) {
++        current = (await auth.refresh(current.refreshToken)).tokens;
++      }
++      await expect(auth.refresh(current.refreshToken)).resolves.toBeDefined();
++    });
++
++    it('treats a replayed token as theft and revokes the whole family', async () => {
++      const { tokens: first } = await registerUser();
++      const next = await auth.refresh(first.refreshToken);
++
++      await expect(auth.refresh(first.refreshToken)).rejects.toThrow(
++        /Invalid or expired/,
++      );
++
++      // The legitimate newest token is dead too.
++      await expect(auth.refresh(next.tokens.refreshToken)).rejects.toThrow();
++      const familyId = (await tokenRow(first.refreshToken)).familyId;
++      const rows = await familyRows(familyId);
++      expect(rows.every((r) => r.revokedAt !== null)).toBe(true);
++    });
++
++    it("does not touch the user's other devices when one session is replayed", async () => {
++      const { email } = await registerUser();
++      const phone = await auth.login(email, PASSWORD);
++      const laptop = await auth.login(email, PASSWORD);
++
++      const rotated = await auth.refresh(phone.tokens.refreshToken);
++      await expect(auth.refresh(phone.tokens.refreshToken)).rejects.toThrow();
++
++      expect(rotated).toBeDefined();
++      await expect(
++        auth.refresh(laptop.tokens.refreshToken),
++      ).resolves.toBeDefined();
++    });
++
++    it('lets exactly one of several simultaneous refreshes through', async () => {
++      const { tokens: first } = await registerUser();
++
++      const outcomes = await Promise.allSettled(
++        Array.from({ length: 5 }, () => auth.refresh(first.refreshToken)),
++      );
++
++      expect(outcomes.filter((o) => o.status === 'fulfilled')).toHaveLength(1);
++    });
++
++    it('rejects an expired token without revoking it', async () => {
++      const { tokens: first } = await registerUser();
++      const row = await tokenRow(first.refreshToken);
++      await dataSource
++        .getRepository(RefreshToken)
++        .update(row.id, { expiresAt: new Date(Date.now() - 1000) });
++
++      await expect(auth.refresh(first.refreshToken)).rejects.toThrow(
++        /Invalid or expired/,
++      );
++      expect((await tokenRow(first.refreshToken)).revokedAt).toBeNull();
++    });
++
++    it('rejects unknown tokens', async () => {
++      await expect(auth.refresh('not-a-real-token')).rejects.toThrow(
++        /Invalid or expired/,
++      );
++    });
++
++    it('refuses and revokes when the account was disabled', async () => {
++      const { user, tokens: first } = await registerUser();
++      await dataSource.getRepository(User).update(user.id, { isActive: false });
++
++      await expect(auth.refresh(first.refreshToken)).rejects.toThrow();
++      expect((await tokenRow(first.refreshToken)).revokedAt).not.toBeNull();
++    });
++  });
++
++  describe('logout', () => {
++    it('ends only the session it was called for', async () => {
++      const { email } = await registerUser();
++      const phone = await auth.login(email, PASSWORD);
++      const laptop = await auth.login(email, PASSWORD);
++
++      await auth.logout(phone.tokens.refreshToken);
++
++      await expect(auth.refresh(phone.tokens.refreshToken)).rejects.toThrow();
++      await expect(
++        auth.refresh(laptop.tokens.refreshToken),
++      ).resolves.toBeDefined();
++    });
++
++    it('is a no-op for unknown tokens', async () => {
++      await expect(auth.logout('garbage')).resolves.toBeUndefined();
++    });
++
++    it('logoutAll ends every session of the user', async () => {
++      const { email, user } = await registerUser();
++      const a = await auth.login(email, PASSWORD);
++      const b = await auth.login(email, PASSWORD);
++
++      await auth.logoutAll(user.id);
++
++      await expect(auth.refresh(a.tokens.refreshToken)).rejects.toThrow();
++      await expect(auth.refresh(b.tokens.refreshToken)).rejects.toThrow();
++      expect(
++        await dataSource
++          .getRepository(RefreshToken)
++          .countBy({ userId: user.id, revokedAt: IsNull() }),
++      ).toBe(0);
++    });
++  });
++
++  describe('changePassword', () => {
++    it('swaps the password, signs out every device and returns a fresh session', async () => {
++      const { email, user, tokens: oldSession } = await registerUser();
++      const otherDevice = await auth.login(email, PASSWORD);
++
++      const result = await auth.changePassword(
++        user.id,
++        PASSWORD,
++        'a brand new pass 1',
++      );
++
++      await expect(auth.login(email, PASSWORD)).rejects.toThrow();
++      await expect(
++        auth.login(email, 'a brand new pass 1'),
++      ).resolves.toBeDefined();
++      await expect(auth.refresh(oldSession.refreshToken)).rejects.toThrow();
++      await expect(
++        auth.refresh(otherDevice.tokens.refreshToken),
++      ).rejects.toThrow();
++      await expect(
++        auth.refresh(result.tokens.refreshToken),
++      ).resolves.toBeDefined();
++    });
++
++    it('requires the current password and a different new one', async () => {
++      const { user } = await registerUser();
++
++      await expect(
++        auth.changePassword(user.id, 'wrong password', 'a brand new pass 1'),
++      ).rejects.toThrow(/Current password is incorrect/);
++      await expect(
++        auth.changePassword(user.id, PASSWORD, PASSWORD),
++      ).rejects.toThrow(/different/);
++    });
++  });
++});
+diff --git a/apps/api/src/modules/auth/auth.service.ts b/apps/api/src/modules/auth/auth.service.ts
+new file mode 100644
+index 0000000..3c0308f
+--- /dev/null
++++ b/apps/api/src/modules/auth/auth.service.ts
+@@ -0,0 +1,366 @@
++import {
++  BadRequestException,
++  ConflictException,
++  ForbiddenException,
++  Injectable,
++  NotFoundException,
++  UnauthorizedException,
++} from '@nestjs/common';
++import { randomUUID } from 'node:crypto';
++import { DataSource, EntityManager, IsNull } from 'typeorm';
++
++import {
++  AuthIdentity,
++  AuthProvider,
++} from '../../database/entities/auth-identity.entity';
++import { RefreshToken } from '../../database/entities/refresh-token.entity';
++import { User } from '../../database/entities/user.entity';
++import { Wallet } from '../../database/entities/wallet.entity';
++import { PasswordService } from './password.service';
++import { TokenService } from './token.service';
++import {
++  AuthResponse,
++  AuthTokens,
++  RequestContext,
++  UserProfile,
++} from './auth.types';
++
++const UNIQUE_VIOLATION = '23505';
++const INVALID_CREDENTIALS = 'Invalid email or password';
++const INVALID_REFRESH_TOKEN = 'Invalid or expired refresh token';
++
++export interface RegisterInput {
++  email: string;
++  password: string;
++  phoneNumber?: string;
++}
++
++type RefreshOutcome =
++  | { kind: 'ok'; user: User; refreshToken: string }
++  | { kind: 'invalid' | 'expired' | 'reuse' | 'inactive' };
++
++@Injectable()
++export class AuthService {
++  constructor(
++    private readonly dataSource: DataSource,
++    private readonly tokens: TokenService,
++    private readonly passwords: PasswordService,
++  ) {}
++
++  async register(
++    input: RegisterInput,
++    context: RequestContext = {},
++  ): Promise<AuthResponse> {
++    const email = normalizeEmail(input.email);
++    // Hash before opening the transaction: bcrypt is slow and must not hold
++    // a database connection while it runs.
++    const passwordHash = await this.passwords.hash(input.password);
++
++    let created: { user: User; refreshToken: string };
++
++    try {
++      created = await this.dataSource.transaction(async (manager) => {
++        const user = await manager.getRepository(User).save(
++          manager.getRepository(User).create({
++            email,
++            phoneNumber: input.phoneNumber ?? null,
++          }),
++        );
++
++        await manager.getRepository(AuthIdentity).save(
++          manager.getRepository(AuthIdentity).create({
++            userId: user.id,
++            provider: AuthProvider.PASSWORD,
++            providerAccountId: user.id,
++            passwordHash,
++          }),
++        );
++
++        // Every user gets exactly one wallet (userId is unique on wallets).
++        await manager
++          .getRepository(Wallet)
++          .save(manager.getRepository(Wallet).create({ userId: user.id }));
++
++        const refresh = await this.createRefreshToken(
++          manager,
++          user.id,
++          randomUUID(),
++          context,
++        );
++
++        return { user, refreshToken: refresh.token };
++      });
++    } catch (error) {
++      if (getPgErrorCode(error) === UNIQUE_VIOLATION) {
++        throw new ConflictException(
++          'An account with this email already exists',
++        );
++      }
++      throw error;
++    }
++
++    return this.buildResponse(created.user, created.refreshToken);
++  }
++
++  async login(
++    email: string,
++    password: string,
++    context: RequestContext = {},
++  ): Promise<AuthResponse> {
++    const user = await this.dataSource
++      .getRepository(User)
++      .findOne({ where: { email: normalizeEmail(email) } });
++
++    const identity = user
++      ? await this.dataSource.getRepository(AuthIdentity).findOne({
++          where: { userId: user.id, provider: AuthProvider.PASSWORD },
++        })
++      : null;
++
++    let valid = false;
++
++    if (identity?.passwordHash) {
++      valid = await this.passwords.verify(password, identity.passwordHash);
++    } else {
++      // Unknown email: do the same amount of work so timing does not reveal
++      // which emails have accounts.
++      await this.passwords.burn(password);
++    }
++
++    if (!user || !valid) {
++      throw new UnauthorizedException(INVALID_CREDENTIALS);
++    }
++
++    // Checked only after the password is proven, so a disabled account is not
++    // revealed to someone who does not know its password.
++    if (!user.isActive) {
++      throw new ForbiddenException('This account is disabled');
++    }
++
++    const refresh = await this.dataSource.transaction((manager) =>
++      this.createRefreshToken(manager, user.id, randomUUID(), context),
++    );
++
++    return this.buildResponse(user, refresh.token);
++  }
++
++  /**
++   * Exchanges a refresh token for a new access + refresh pair and retires the
++   * old one. Presenting a token that was already rotated means it leaked (or a
++   * client raced itself), so the whole session family is revoked.
++   */
++  async refresh(
++    rawToken: string,
++    context: RequestContext = {},
++  ): Promise<AuthResponse> {
++    const hash = this.tokens.hashRefreshToken(rawToken);
++
++    const outcome = await this.dataSource.transaction(
++      async (manager): Promise<RefreshOutcome> => {
++        const stored = await manager
++          .getRepository(RefreshToken)
++          .createQueryBuilder('token')
++          .setLock('pessimistic_write')
++          .where('token.tokenHash = :hash', { hash })
++          .getOne();
++
++        if (!stored) {
++          return { kind: 'invalid' };
++        }
++
++        const now = new Date();
++
++        if (stored.revokedAt) {
++          await this.revokeFamily(manager, stored.familyId, now);
++          return { kind: 'reuse' };
++        }
++
++        if (stored.expiresAt.getTime() <= now.getTime()) {
++          return { kind: 'expired' };
++        }
++
++        const user = await manager
++          .getRepository(User)
++          .findOne({ where: { id: stored.userId } });
++
++        if (!user || !user.isActive) {
++          await this.revokeFamily(manager, stored.familyId, now);
++          return { kind: 'inactive' };
++        }
++
++        const next = await this.createRefreshToken(
++          manager,
++          user.id,
++          stored.familyId,
++          context,
++        );
++
++        await manager
++          .getRepository(RefreshToken)
++          .update(stored.id, { revokedAt: now, replacedByTokenId: next.id });
++
++        return { kind: 'ok', user, refreshToken: next.token };
++      },
++    );
++
++    // Thrown after the transaction commits so a reuse revocation persists.
++    if (outcome.kind !== 'ok') {
++      throw new UnauthorizedException(INVALID_REFRESH_TOKEN);
++    }
++
++    return this.buildResponse(outcome.user, outcome.refreshToken);
++  }
++
++  /** Ends the session the token belongs to. Unknown tokens are ignored. */
++  async logout(rawToken: string): Promise<void> {
++    const hash = this.tokens.hashRefreshToken(rawToken);
++
++    await this.dataSource.transaction(async (manager) => {
++      const stored = await manager
++        .getRepository(RefreshToken)
++        .findOne({ where: { tokenHash: hash } });
++
++      if (stored) {
++        await this.revokeFamily(manager, stored.familyId, new Date());
++      }
++    });
++  }
++
++  /** Ends every session of the user (all devices). */
++  async logoutAll(userId: string): Promise<void> {
++    await this.dataSource
++      .getRepository(RefreshToken)
++      .update({ userId, revokedAt: IsNull() }, { revokedAt: new Date() });
++  }
++
++  async changePassword(
++    userId: string,
++    currentPassword: string,
++    newPassword: string,
++    context: RequestContext = {},
++  ): Promise<AuthResponse> {
++    if (currentPassword === newPassword) {
++      throw new BadRequestException(
++        'New password must be different from the current password',
++      );
++    }
++
++    const user = await this.dataSource
++      .getRepository(User)
++      .findOne({ where: { id: userId } });
++    const identity = await this.dataSource.getRepository(AuthIdentity).findOne({
++      where: { userId, provider: AuthProvider.PASSWORD },
++    });
++
++    if (!user || !identity?.passwordHash) {
++      throw new NotFoundException(
++        'Password login is not set up for this account',
++      );
++    }
++
++    // 400, not 401: a 401 would make clients try to refresh their session.
++    if (
++      !(await this.passwords.verify(currentPassword, identity.passwordHash))
++    ) {
++      throw new BadRequestException('Current password is incorrect');
++    }
++
++    const passwordHash = await this.passwords.hash(newPassword);
++
++    const refresh = await this.dataSource.transaction(async (manager) => {
++      await manager
++        .getRepository(AuthIdentity)
++        .update(identity.id, { passwordHash });
++
++      // A password change signs out every device, including this one, then
++      // starts a fresh session for the caller.
++      await manager
++        .getRepository(RefreshToken)
++        .update({ userId, revokedAt: IsNull() }, { revokedAt: new Date() });
++
++      return this.createRefreshToken(manager, userId, randomUUID(), context);
++    });
++
++    return this.buildResponse(user, refresh.token);
++  }
++
++  async getProfile(userId: string): Promise<UserProfile> {
++    const user = await this.dataSource
++      .getRepository(User)
++      .findOne({ where: { id: userId } });
++
++    if (!user) {
++      throw new NotFoundException('User not found');
++    }
++
++    return toProfile(user);
++  }
++
++  private async createRefreshToken(
++    manager: EntityManager,
++    userId: string,
++    familyId: string,
++    context: RequestContext,
++  ): Promise<{ id: string; token: string }> {
++    const { token, hash } = this.tokens.generateRefreshToken();
++
++    const saved = await manager.getRepository(RefreshToken).save(
++      manager.getRepository(RefreshToken).create({
++        userId,
++        familyId,
++        tokenHash: hash,
++        expiresAt: new Date(Date.now() + this.tokens.refreshTtlMs),
++        ipAddress: context.ip?.slice(0, 64) ?? null,
++        userAgent: context.userAgent?.slice(0, 255) ?? null,
++      }),
++    );
++
++    return { id: saved.id, token };
++  }
++
++  private async revokeFamily(
++    manager: EntityManager,
++    familyId: string,
++    at: Date,
++  ): Promise<void> {
++    await manager
++      .getRepository(RefreshToken)
++      .update({ familyId, revokedAt: IsNull() }, { revokedAt: at });
++  }
++
++  private async buildResponse(
++    user: User,
++    refreshToken: string,
++  ): Promise<AuthResponse> {
++    const tokens: AuthTokens = {
++      accessToken: await this.tokens.signAccessToken(user.id),
++      refreshToken,
++      expiresIn: this.tokens.accessTtlSeconds,
++    };
++
++    return { user: toProfile(user), tokens };
++  }
++}
++
++export function normalizeEmail(email: string): string {
++  return email.trim().toLowerCase();
++}
++
++function toProfile(user: User): UserProfile {
++  return {
++    id: user.id,
++    email: user.email,
++    phoneNumber: user.phoneNumber,
++    role: user.role,
++    createdAt: user.createdAt,
++  };
++}
++
++function getPgErrorCode(error: unknown): string | undefined {
++  const candidate = error as {
++    code?: string;
++    driverError?: { code?: string };
++  };
++
++  return candidate?.driverError?.code ?? candidate?.code;
++}
+diff --git a/apps/api/src/modules/auth/auth.types.ts b/apps/api/src/modules/auth/auth.types.ts
+new file mode 100644
+index 0000000..2d610d4
+--- /dev/null
++++ b/apps/api/src/modules/auth/auth.types.ts
+@@ -0,0 +1,36 @@
++import type { Request } from 'express';
++
++import { UserRole } from '../../database/enums/user-role.enum';
++
++export interface AuthenticatedUser {
++  id: string;
++  email: string;
++  role: UserRole;
++}
++
++export type AuthenticatedRequest = Request & { user?: AuthenticatedUser };
++
++export interface RequestContext {
++  ip?: string;
++  userAgent?: string;
++}
++
++export interface UserProfile {
++  id: string;
++  email: string;
++  phoneNumber: string | null;
++  role: UserRole;
++  createdAt: Date;
++}
++
++export interface AuthTokens {
++  accessToken: string;
++  refreshToken: string;
++  /** Access token lifetime in seconds. */
++  expiresIn: number;
++}
++
++export interface AuthResponse {
++  user: UserProfile;
++  tokens: AuthTokens;
++}
+diff --git a/apps/api/src/modules/auth/decorators/auth.decorators.ts b/apps/api/src/modules/auth/decorators/auth.decorators.ts
+new file mode 100644
+index 0000000..425a069
+--- /dev/null
++++ b/apps/api/src/modules/auth/decorators/auth.decorators.ts
+@@ -0,0 +1,30 @@
++import {
++  createParamDecorator,
++  ExecutionContext,
++  SetMetadata,
++} from '@nestjs/common';
++
++import { UserRole } from '../../../database/enums/user-role.enum';
++import { AuthenticatedRequest, AuthenticatedUser } from '../auth.types';
++
++export const IS_PUBLIC_KEY = 'isPublic';
++export const ROLES_KEY = 'roles';
++
++/** Opts a route out of the global authentication guard. */
++export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);
++
++/** Restricts a route to the given roles (authentication is still required). */
++export const Roles = (...roles: UserRole[]) => SetMetadata(ROLES_KEY, roles);
++
++export const CurrentUser = createParamDecorator(
++  (_data: unknown, context: ExecutionContext): AuthenticatedUser => {
++    const request = context.switchToHttp().getRequest<AuthenticatedRequest>();
++
++    if (!request.user) {
++      // Only reachable on a @Public() route, which is a programming error.
++      throw new Error('CurrentUser used on a route without authentication');
++    }
++
++    return request.user;
++  },
++);
+diff --git a/apps/api/src/modules/auth/dto/auth.dto.ts b/apps/api/src/modules/auth/dto/auth.dto.ts
+new file mode 100644
+index 0000000..b077d2c
+--- /dev/null
++++ b/apps/api/src/modules/auth/dto/auth.dto.ts
+@@ -0,0 +1,72 @@
++import { Transform } from 'class-transformer';
++import {
++  IsByteLength,
++  IsEmail,
++  IsOptional,
++  IsString,
++  Matches,
++  MaxLength,
++} from 'class-validator';
++
++// bcrypt only looks at the first 72 bytes, so longer passwords are rejected
++// instead of being silently truncated.
++const PASSWORD_MIN_BYTES = 8;
++const PASSWORD_MAX_BYTES = 72;
++const PASSWORD_MESSAGE = `password must be between ${PASSWORD_MIN_BYTES} and ${PASSWORD_MAX_BYTES} bytes`;
++
++const trimAndLowercase = ({ value }: { value: unknown }): unknown =>
++  typeof value === 'string' ? value.trim().toLowerCase() : value;
++
++export class RegisterDto {
++  @Transform(trimAndLowercase)
++  @IsEmail()
++  @MaxLength(254)
++  email!: string;
++
++  @IsString()
++  @IsByteLength(PASSWORD_MIN_BYTES, PASSWORD_MAX_BYTES, {
++    message: PASSWORD_MESSAGE,
++  })
++  password!: string;
++
++  /** Nigerian mobile number: 08012345678 or +2348012345678. */
++  @IsOptional()
++  @Transform(({ value }: { value: unknown }) =>
++    typeof value === 'string' ? value.replace(/\s+/g, '') : value,
++  )
++  @Matches(/^(?:\+234|0)[789][01]\d{8}$/, {
++    message: 'phoneNumber must be a valid Nigerian mobile number',
++  })
++  phoneNumber?: string;
++}
++
++export class LoginDto {
++  @Transform(trimAndLowercase)
++  @IsEmail()
++  @MaxLength(254)
++  email!: string;
++
++  // Not length-checked on login: only registration and password changes
++  // enforce the policy. Capped so nobody can submit megabytes to bcrypt.
++  @IsString()
++  @MaxLength(128)
++  password!: string;
++}
++
++export class RefreshTokenDto {
++  @IsString()
++  @MaxLength(256)
++  refreshToken!: string;
++}
++
++export class ChangePasswordDto {
++  @IsString()
++  @MaxLength(128)
++  currentPassword!: string;
++
++  @IsString()
++  @IsByteLength(PASSWORD_MIN_BYTES, PASSWORD_MAX_BYTES, {
++    message: `new ${PASSWORD_MESSAGE}`,
++  })
++  newPassword!: string;
++}
+diff --git a/apps/api/src/modules/auth/guards/jwt-auth.guard.ts b/apps/api/src/modules/auth/guards/jwt-auth.guard.ts
+new file mode 100644
+index 0000000..b64977f
+--- /dev/null
++++ b/apps/api/src/modules/auth/guards/jwt-auth.guard.ts
+@@ -0,0 +1,74 @@
++import {
++  CanActivate,
++  ExecutionContext,
++  Injectable,
++  UnauthorizedException,
++} from '@nestjs/common';
++import { Reflector } from '@nestjs/core';
++import { DataSource } from 'typeorm';
++
++import { User } from '../../../database/entities/user.entity';
++import { AuthenticatedRequest } from '../auth.types';
++import { IS_PUBLIC_KEY } from '../decorators/auth.decorators';
++import { TokenService } from '../token.service';
++
++/**
++ * Registered globally: every route requires a valid access token unless it is
++ * marked @Public(). The user is re-read on each request so that disabling an
++ * account, or changing its role, takes effect immediately instead of when the
++ * access token expires.
++ */
++@Injectable()
++export class JwtAuthGuard implements CanActivate {
++  constructor(
++    private readonly reflector: Reflector,
++    private readonly tokens: TokenService,
++    private readonly dataSource: DataSource,
++  ) {}
++
++  async canActivate(context: ExecutionContext): Promise<boolean> {
++    const isPublic = this.reflector.getAllAndOverride<boolean | undefined>(
++      IS_PUBLIC_KEY,
++      [context.getHandler(), context.getClass()],
++    );
++
++    if (isPublic) {
++      return true;
++    }
++
++    const request = context.switchToHttp().getRequest<AuthenticatedRequest>();
++    const token = extractBearerToken(request.headers.authorization);
++
++    if (!token) {
++      throw new UnauthorizedException('Missing bearer token');
++    }
++
++    const userId = await this.tokens.verifyAccessToken(token);
++
++    const user = await this.dataSource.getRepository(User).findOne({
++      where: { id: userId },
++      select: { id: true, email: true, role: true, isActive: true },
++    });
++
++    if (!user || !user.isActive) {
++      throw new UnauthorizedException('Invalid or expired access token');
++    }
++
++    request.user = { id: user.id, email: user.email, role: user.role };
++    return true;
++  }
++}
++
++function extractBearerToken(header: string | undefined): string | null {
++  if (!header) {
++    return null;
++  }
++
++  const [scheme, token, ...rest] = header.split(' ');
++
++  if (scheme?.toLowerCase() !== 'bearer' || !token || rest.length > 0) {
++    return null;
++  }
++
++  return token;
++}
+diff --git a/apps/api/src/modules/auth/guards/roles.guard.ts b/apps/api/src/modules/auth/guards/roles.guard.ts
+new file mode 100644
+index 0000000..8891aab
+--- /dev/null
++++ b/apps/api/src/modules/auth/guards/roles.guard.ts
+@@ -0,0 +1,26 @@
++import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
++import { Reflector } from '@nestjs/core';
++
++import { UserRole } from '../../../database/enums/user-role.enum';
++import { AuthenticatedRequest } from '../auth.types';
++import { ROLES_KEY } from '../decorators/auth.decorators';
++
++@Injectable()
++export class RolesGuard implements CanActivate {
++  constructor(private readonly reflector: Reflector) {}
++
++  canActivate(context: ExecutionContext): boolean {
++    const required = this.reflector.getAllAndOverride<UserRole[] | undefined>(
++      ROLES_KEY,
++      [context.getHandler(), context.getClass()],
++    );
++
++    if (!required || required.length === 0) {
++      return true;
++    }
++
++    const request = context.switchToHttp().getRequest<AuthenticatedRequest>();
++
++    return !!request.user && required.includes(request.user.role);
++  }
++}
+diff --git a/apps/api/src/modules/auth/index.ts b/apps/api/src/modules/auth/index.ts
+new file mode 100644
+index 0000000..35127e0
+--- /dev/null
++++ b/apps/api/src/modules/auth/index.ts
+@@ -0,0 +1,4 @@
++export * from './auth.module';
++export * from './auth.service';
++export * from './auth.types';
++export * from './decorators/auth.decorators';
+diff --git a/apps/api/src/modules/auth/password.service.ts b/apps/api/src/modules/auth/password.service.ts
+new file mode 100644
+index 0000000..5d1a255
+--- /dev/null
++++ b/apps/api/src/modules/auth/password.service.ts
+@@ -0,0 +1,35 @@
++import { Inject, Injectable } from '@nestjs/common';
++import type { ConfigType } from '@nestjs/config';
++import * as bcrypt from 'bcrypt';
++import { randomBytes } from 'node:crypto';
++
++import authConfig from '../../config/auth.config';
++
++@Injectable()
++export class PasswordService {
++  private readonly dummyHash: Promise<string>;
++
++  constructor(
++    @Inject(authConfig.KEY)
++    private readonly config: ConfigType<typeof authConfig>,
++  ) {
++    // Same cost factor as real hashes, so comparing against it takes as long.
++    this.dummyHash = bcrypt.hash(
++      randomBytes(16).toString('hex'),
++      config.bcryptRounds,
++    );
++  }
++
++  hash(password: string): Promise<string> {
++    return bcrypt.hash(password, this.config.bcryptRounds);
++  }
++
++  verify(password: string, hash: string): Promise<boolean> {
++    return bcrypt.compare(password, hash);
++  }
++
++  /** Spends the same time as a real check when the account does not exist. */
++  async burn(password: string): Promise<void> {
++    await bcrypt.compare(password, await this.dummyHash);
++  }
++}
+diff --git a/apps/api/src/modules/auth/token.service.ts b/apps/api/src/modules/auth/token.service.ts
+new file mode 100644
+index 0000000..00a29d9
+--- /dev/null
++++ b/apps/api/src/modules/auth/token.service.ts
+@@ -0,0 +1,76 @@
++import { Inject, Injectable, UnauthorizedException } from '@nestjs/common';
++import type { ConfigType } from '@nestjs/config';
++import { JwtService } from '@nestjs/jwt';
++import { createHmac, randomBytes } from 'node:crypto';
++
++import authConfig from '../../config/auth.config';
++
++const ISSUER = 'data-app-api';
++const AUDIENCE = 'data-app-clients';
++const ALGORITHM = 'HS256';
++
++interface AccessTokenPayload {
++  sub: string;
++  typ: 'access';
++}
++
++@Injectable()
++export class TokenService {
++  constructor(
++    private readonly jwt: JwtService,
++    @Inject(authConfig.KEY)
++    private readonly config: ConfigType<typeof authConfig>,
++  ) {}
++
++  get accessTtlSeconds(): number {
++    return this.config.accessTtlSeconds;
++  }
++
++  get refreshTtlMs(): number {
++    return this.config.refreshTtlDays * 24 * 60 * 60 * 1000;
++  }
++
++  signAccessToken(userId: string): Promise<string> {
++    const payload: AccessTokenPayload = { sub: userId, typ: 'access' };
++
++    return this.jwt.signAsync(payload, {
++      secret: this.config.accessSecret,
++      algorithm: ALGORITHM,
++      expiresIn: this.config.accessTtlSeconds,
++      issuer: ISSUER,
++      audience: AUDIENCE,
++    });
++  }
++
++  /** Returns the user id, or throws 401 for any invalid token. */
++  async verifyAccessToken(token: string): Promise<string> {
++    try {
++      const payload = await this.jwt.verifyAsync<AccessTokenPayload>(token, {
++        secret: this.config.accessSecret,
++        algorithms: [ALGORITHM],
++        issuer: ISSUER,
++        audience: AUDIENCE,
++      });
++
++      if (payload.typ !== 'access' || typeof payload.sub !== 'string') {
++        throw new Error('Not an access token');
++      }
++
++      return payload.sub;
++    } catch {
++      throw new UnauthorizedException('Invalid or expired access token');
++    }
++  }
++
++  /** Opaque, 256-bit random token. Only its hash is stored. */
++  generateRefreshToken(): { token: string; hash: string } {
++    const token = randomBytes(32).toString('base64url');
++    return { token, hash: this.hashRefreshToken(token) };
++  }
++
++  hashRefreshToken(token: string): string {
++    return createHmac('sha256', this.config.refreshSecret)
++      .update(token)
++      .digest('hex');
++  }
++}
+diff --git a/apps/api/src/testing/test-auth.ts b/apps/api/src/testing/test-auth.ts
+new file mode 100644
+index 0000000..38404a5
+--- /dev/null
++++ b/apps/api/src/testing/test-auth.ts
+@@ -0,0 +1,26 @@
++import { JwtService } from '@nestjs/jwt';
++import { DataSource } from 'typeorm';
++
++import { AuthService } from '../modules/auth/auth.service';
++import { PasswordService } from '../modules/auth/password.service';
++import { TokenService } from '../modules/auth/token.service';
++
++export const TEST_AUTH_CONFIG = {
++  accessSecret: 'test-access-secret-test-access-secret-0123456789',
++  refreshSecret: 'test-refresh-secret-test-refresh-secret-0123456789',
++  accessTtlSeconds: 900,
++  refreshTtlDays: 30,
++  // Minimum cost keeps the suite fast; production uses 12.
++  bcryptRounds: 4,
++};
++
++export function createAuthServices(dataSource: DataSource) {
++  const tokens = new TokenService(new JwtService({}), TEST_AUTH_CONFIG);
++  const passwords = new PasswordService(TEST_AUTH_CONFIG);
++  const auth = new AuthService(dataSource, tokens, passwords);
++
++  return { auth, tokens, passwords };
++}
++
++export const uniqueEmail = (prefix = 'user') =>
++  `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}@test.local`;
+diff --git a/apps/api/tsconfig.jest.json b/apps/api/tsconfig.jest.json
+new file mode 100644
+index 0000000..f5b6e0b
+--- /dev/null
++++ b/apps/api/tsconfig.jest.json
+@@ -0,0 +1,4 @@
++{
++  "extends": "./tsconfig.json",
++  "compilerOptions": { "allowJs": true, "esModuleInterop": true }
++}
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 23d65d0..a0061e6 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -29,6 +29,9 @@ importers:
+       '@nestjs/platform-express':
+         specifier: ^11.0.1
+         version: 11.2.7(@nestjs/common@11.2.7(class-transformer@0.5.1)(class-validator@0.15.1)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.2.7)
++      '@nestjs/throttler':
++        specifier: ^6.7.1
++        version: 6.7.1(@nestjs/common@11.2.7(class-transformer@0.5.1)(class-validator@0.15.1)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.2.7)(reflect-metadata@0.2.2)
+       '@nestjs/typeorm':
+         specifier: ^12.0.2
+         version: 12.0.2(@nestjs/common@11.2.7(class-transformer@0.5.1)(class-validator@0.15.1)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.2.7)(reflect-metadata@0.2.2)(rxjs@7.8.2)(typeorm@1.1.1(pg@8.23.1)(ts-node@10.9.2(@swc/core@1.16.13(@swc/helpers@0.5.23))(@types/node@22.20.4)(typescript@5.9.3)))
+@@ -1614,6 +1617,14 @@ packages:
+       '@nestjs/platform-express':
+         optional: true
+ 
++  '@nestjs/throttler@6.7.1':
++    resolution: {integrity: sha512-gAyY1AkU+cSK5DCjFOB43xax9oakameH4xZa9kAgqBqSBQZgmv3DZylLV8KyZNzOGhceL3kDVtby+CF8VAdmEA==}
++    engines: {node: ^20.19.0 || ^22.12.0 || >=24.0.0}
++    peerDependencies:
++      '@nestjs/common': ^7.0.0 || ^8.0.0 || ^9.0.0 || ^10.0.0 || ^11.0.0 || ^12.0.0
++      '@nestjs/core': ^7.0.0 || ^8.0.0 || ^9.0.0 || ^10.0.0 || ^11.0.0 || ^12.0.0
++      reflect-metadata: ^0.1.13 || ^0.2.0
++
+   '@nestjs/typeorm@12.0.2':
+     resolution: {integrity: sha512-16b8s8mGkQdTH4i+dhhCwYkfuhWpLMdtuK82vOMjwa5ZpKYjFohU2jvbqkEJmx03fVO4HEpb0aw4VQXo+lxdKw==}
+     engines: {node: '>=20.19.0'}
+@@ -8663,6 +8674,12 @@ snapshots:
+     optionalDependencies:
+       '@nestjs/platform-express': 11.2.7(@nestjs/common@11.2.7(class-transformer@0.5.1)(class-validator@0.15.1)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.2.7)
+ 
++  '@nestjs/throttler@6.7.1(@nestjs/common@11.2.7(class-transformer@0.5.1)(class-validator@0.15.1)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.2.7)(reflect-metadata@0.2.2)':
++    dependencies:
++      '@nestjs/common': 11.2.7(class-transformer@0.5.1)(class-validator@0.15.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)
++      '@nestjs/core': 11.2.7(@nestjs/common@11.2.7(class-transformer@0.5.1)(class-validator@0.15.1)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/platform-express@11.2.7)(reflect-metadata@0.2.2)(rxjs@7.8.2)
++      reflect-metadata: 0.2.2
++
+   '@nestjs/typeorm@12.0.2(@nestjs/common@11.2.7(class-transformer@0.5.1)(class-validator@0.15.1)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.2.7)(reflect-metadata@0.2.2)(rxjs@7.8.2)(typeorm@1.1.1(pg@8.23.1)(ts-node@10.9.2(@swc/core@1.16.13(@swc/helpers@0.5.23))(@types/node@22.20.4)(typescript@5.9.3)))':
+     dependencies:
+       '@nestjs/common': 11.2.7(class-transformer@0.5.1)(class-validator@0.15.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+@@ -9051,9 +9068,7 @@ snapshots:
+       metro-runtime: 0.84.6
+     transitivePeerDependencies:
+       - '@babel/core'
+-      - bufferutil
+       - supports-color
+-      - utf-8-validate
+ 
+   '@react-native/normalize-colors@0.74.89': {}
+ 
+@@ -10847,7 +10862,7 @@ snapshots:
+       eslint: 9.39.5(jiti@2.7.0)
+       eslint-import-resolver-node: 0.3.10
+       eslint-import-resolver-typescript: 3.10.1(eslint-plugin-import@2.32.0(eslint@9.39.5(jiti@2.7.0)))(eslint@9.39.5(jiti@2.7.0))
+-      eslint-plugin-import: 2.32.0(eslint-import-resolver-typescript@3.10.1(eslint-plugin-import@2.32.0(eslint@9.39.5(jiti@2.7.0)))(eslint@9.39.5(jiti@2.7.0)))(eslint@9.39.5(jiti@2.7.0))
++      eslint-plugin-import: 2.32.0(eslint-import-resolver-typescript@3.10.1)(eslint@9.39.5(jiti@2.7.0))
+       eslint-plugin-jsx-a11y: 6.10.2(eslint@9.39.5(jiti@2.7.0))
+       eslint-plugin-react: 7.37.5(eslint@9.39.5(jiti@2.7.0))
+       eslint-plugin-react-hooks: 7.1.1(eslint@9.39.5(jiti@2.7.0))
+@@ -10884,7 +10899,7 @@ snapshots:
+       tinyglobby: 0.2.17
+       unrs-resolver: 1.12.2
+     optionalDependencies:
+-      eslint-plugin-import: 2.32.0(eslint-import-resolver-typescript@3.10.1(eslint-plugin-import@2.32.0(eslint@9.39.5(jiti@2.7.0)))(eslint@9.39.5(jiti@2.7.0)))(eslint@9.39.5(jiti@2.7.0))
++      eslint-plugin-import: 2.32.0(eslint-import-resolver-typescript@3.10.1)(eslint@9.39.5(jiti@2.7.0))
+     transitivePeerDependencies:
+       - supports-color
+ 
+@@ -10898,7 +10913,7 @@ snapshots:
+     transitivePeerDependencies:
+       - supports-color
+ 
+-  eslint-plugin-import@2.32.0(eslint-import-resolver-typescript@3.10.1(eslint-plugin-import@2.32.0(eslint@9.39.5(jiti@2.7.0)))(eslint@9.39.5(jiti@2.7.0)))(eslint@9.39.5(jiti@2.7.0)):
++  eslint-plugin-import@2.32.0(eslint-import-resolver-typescript@3.10.1)(eslint@9.39.5(jiti@2.7.0)):
+     dependencies:
+       '@rtsao/scc': 1.1.0
+       array-includes: 3.2.0
