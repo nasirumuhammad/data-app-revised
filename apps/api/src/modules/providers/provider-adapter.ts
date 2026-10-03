@@ -55,12 +55,24 @@ export class ProviderRequestNotSentError extends Error {
   }
 }
 
+export interface ProviderStatusQuery {
+  reference: string;
+  providerReference?: string | null;
+}
+
+export interface ProviderStatusResult {
+  status: ProviderOperationStatus;
+  providerReference?: string;
+  message?: string;
+  raw?: Record<string, unknown>;
+}
+
 export interface ProviderAdapter {
   readonly code: string;
 
   purchase(request: ProviderPurchaseRequest): Promise<ProviderPurchaseResult>;
 
-  queryStatus(providerReference: string): Promise<ProviderStatusResult>;
+  queryStatus(query: ProviderStatusQuery): Promise<ProviderStatusResult>;
 
   balance(): Promise<ProviderBalanceResult>;
 }

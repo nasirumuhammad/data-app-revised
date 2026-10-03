@@ -129,4 +129,35 @@ export class TransactionService {
       );
     }
   }
+
+  async claimForProcessing(
+    transactionId: string,
+    userId: string,
+    idempotencyKey: string,
+  ): Promise<Transaction | null> {
+    return this.dataSource.transaction(async (manager) => {
+      const transaction = await manager
+        .getRepository(Transaction)
+        .createQueryBuilder('transaction')
+        .setLock('pessimistic_write')
+        .where('transaction.id = :transactionId', { transactionId })
+        .andWhere('transaction.userId = :userId', { userId })
+        .andWhere('transaction.idempotencyKey = :idempotencyKey', {
+          idempotencyKey,
+        })
+        .getOne();
+
+      if (!transaction) {
+        throw new NotFoundException('Transaction not found');
+      }
+
+      if (transaction.status !== TransactionStatus.PENDING) {
+        return null;
+      }
+
+      transaction.status = TransactionStatus.PROCESSING;
+
+      return manager.getRepository(Transaction).save(transaction);
+    });
+  }
 }
